@@ -1,0 +1,6 @@
+__pycache__/
+.pixi/
+log/
+log-*/
+server.log
+server.pid

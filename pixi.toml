@@ -1,0 +1,12 @@
+[workspace]
+name = "usbip-frame"
+channels = ["conda-forge"]
+platforms = ["linux-aarch64", "linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pyarrow = "*"
+
+[tasks]
+serve = "python usbip_frame.py"
+migrate = "python etnf_migrate.py log"
