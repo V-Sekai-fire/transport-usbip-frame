@@ -75,6 +75,7 @@ class Device:
         self.busid = busid
         self.ifaces = self._interfaces()
         self.claimed = set()
+        self.gone = False
         self.claim_all()
 
     def _interfaces(self):
@@ -201,7 +202,11 @@ class Session:
     def gone(self):
         log("device gone; ending the session")
         self.alive = False
-        self.sock.shutdown(socket.SHUT_RDWR)
+        self.dev.gone = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def transfer(self, seq, direction, ep, out_data, length, interrupt):
         if direction == 1 and not interrupt:
@@ -331,6 +336,10 @@ def serve(dev, port):
                 finally:
                     elog.close()
                 sock.close()
+                if dev.gone:
+                    log("device handle stale; exiting for a fresh supervisor restart")
+                    srv.close()
+                    return
             else:
                 log("unknown op 0x%04x" % code)
                 sock.close()
