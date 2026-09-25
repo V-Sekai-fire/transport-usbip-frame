@@ -9,6 +9,9 @@ param(
     [string]$LogPath = "$env:TEMP\rebocap-attach-watchdog.log"
 )
 $usbip = 'C:\Program Files\USBip\usbip.exe'
+# Singleton: a second watchdog would race the first (attach vs detach flap), so only one runs.
+$mtx = New-Object System.Threading.Mutex($false, 'Global\rebocap-attach-watchdog', [ref]$null)
+if (-not $mtx.WaitOne(0)) { Write-Host 'another watchdog already running; exiting'; exit 0 }
 function Log($m) { "$([DateTime]::Now.ToString('HH:mm:ss')) $m" | Tee-Object -FilePath $LogPath -Append | Out-Null }
 Log "watchdog start: frame=$Frame busid=$Busid"
 $badStreak = 0
