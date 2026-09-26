@@ -1,9 +1,10 @@
-"""A userspace USB/IP server for one device, over libusb (no usbip-host kernel module needed).
+"""A userspace USB/IP server over libusb (no usbip-host kernel module needed).
 
-  python3 usbip_frame.py [--vid 248a --pid 8002] [--port 3240] [--busid 1-1]
+  python3 usbip_frame.py [--port 3240] [--exclude 1-1.2 --exclude 28de:2102]
 
-Exports the device to a USB/IP client, which attaches it so the client's own class driver
-binds it. Implements OP_REQ_DEVLIST, OP_REQ_IMPORT, and URB traffic:
+Exports every non-hub USB device, enumerated from sysfs on each request so a device that
+re-enumerates at a new busid is listed there. A device is opened only while imported, and
+its kernel driver is returned on release. Implements OP_REQ_DEVLIST, OP_REQ_IMPORT, and URB traffic:
 USBIP_CMD_SUBMIT (control, bulk, interrupt) and USBIP_CMD_UNLINK. Isochronous is refused.
 """
 import argparse
@@ -12,7 +13,6 @@ import collections
 import ctypes
 import socket
 import struct
-import sys
 import threading
 import time
 
@@ -45,6 +45,12 @@ L.libusb_get_configuration.argtypes = [c_void_p, ctypes.POINTER(c_int)]
 L.libusb_control_transfer.argtypes = [c_void_p, c_uint8, c_uint8, c_uint16, c_uint16, ctypes.c_char_p, c_uint16, c_uint]
 L.libusb_bulk_transfer.argtypes = [c_void_p, c_uint8, ctypes.c_char_p, c_int, ctypes.POINTER(c_int), c_uint]
 L.libusb_interrupt_transfer.argtypes = [c_void_p, c_uint8, ctypes.c_char_p, c_int, ctypes.POINTER(c_int), c_uint]
+L.libusb_get_device_list.argtypes = [c_void_p, ctypes.POINTER(ctypes.POINTER(c_void_p))]
+L.libusb_free_device_list.argtypes = [ctypes.POINTER(c_void_p), c_int]
+L.libusb_open.argtypes = [c_void_p, ctypes.POINTER(c_void_p)]
+L.libusb_close.argtypes = [c_void_p]
+L.libusb_exit.argtypes = [c_void_p]
+L.libusb_set_auto_detach_kernel_driver.argtypes = [c_void_p, c_int]
 L.libusb_get_config_descriptor.argtypes = [c_void_p, c_uint8, ctypes.POINTER(c_void_p)]
 
 TIMEOUT = -7
@@ -53,7 +59,8 @@ OVERFLOW = -8
 NO_DEVICE = -4
 # Linux errno values the USB/IP client expects in RET_SUBMIT.status.
 EPIPE, ENODEV, EOVERFLOW, EIO, ECONNRESET = -32, -19, -75, -5, -104
-SPEED = {1: 1, 2: 2, 3: 3, 4: 5, 5: 6}  # libusb speed -> usb_device_speed (low, full, high, super, super+)
+SPEED = {"1.5": 1, "12": 2, "480": 3, "5000": 5, "10000": 6, "20000": 6}  # sysfs Mb/s -> usb_device_speed
+SYSFS = "/sys/bus/usb/devices"
 
 
 def log(*a):
@@ -61,25 +68,45 @@ def log(*a):
 
 
 class Device:
-    def __init__(self, vid, pid, busid):
+    def __init__(self, busid):
+        self.busid = busid
+        self.bus, self.addr = int(attr(busid, "busnum")), int(attr(busid, "devnum"))
         self.ctx = c_void_p()
         assert L.libusb_init(ctypes.byref(self.ctx)) == 0
-        self.h = L.libusb_open_device_with_vid_pid(self.ctx, vid, pid)
+        self.h = self._open()
         if not self.h:
-            sys.exit("cannot open %04x:%04x (not present, or no permission on its usbfs node)" % (vid, pid))
-        dev = L.libusb_get_device(self.h)
+            L.libusb_exit(self.ctx)
+            raise OSError("cannot open %s (gone, or no permission on its usbfs node)" % busid)
+        L.libusb_set_auto_detach_kernel_driver(self.h, 1)
         self.desc = DevDesc()
-        L.libusb_get_device_descriptor(dev, ctypes.byref(self.desc))
-        self.bus, self.addr = L.libusb_get_bus_number(dev), L.libusb_get_device_address(dev)
-        self.speed = SPEED.get(L.libusb_get_device_speed(dev), 2)
-        self.busid = busid
+        L.libusb_get_device_descriptor(L.libusb_get_device(self.h), ctypes.byref(self.desc))
         self.ifaces = self._interfaces()
         self.claimed = set()
         self.gone = False
         self.claim_all()
+        self.interrupt_eps = endpoints(self)
+
+    def _open(self):
+        lst, h = ctypes.POINTER(c_void_p)(), c_void_p()
+        n = L.libusb_get_device_list(self.ctx, ctypes.byref(lst))
+        try:
+            for i in range(max(n, 0)):
+                d = lst[i]
+                if L.libusb_get_bus_number(d) == self.bus and L.libusb_get_device_address(d) == self.addr:
+                    return h.value if L.libusb_open(d, ctypes.byref(h)) == 0 else None
+        finally:
+            if n > 0:
+                L.libusb_free_device_list(lst, 1)
+        return None
+
+    def close(self):
+        for n in self.claimed:
+            L.libusb_release_interface(self.h, n)
+        L.libusb_close(self.h)
+        L.libusb_exit(self.ctx)
 
     def _interfaces(self):
-        # One config assumed (bNumConfigurations == 1 for the dongle); read its interface triples.
+        # One config assumed; read its interface triples.
         raw = ctypes.create_string_buffer(512)
         n = L.libusb_control_transfer(self.h, 0x80, 6, 0x0200, 0, raw, 512, 1000)
         out, i, b = [], 0, raw.raw[:max(n, 0)]
@@ -87,28 +114,57 @@ class Device:
             if b[i + 1] == 4:
                 out.append((b[i + 2], b[i + 5], b[i + 6], b[i + 7]))
             i += b[i]
-        self.config_value = b[5] if len(b) > 5 else 1
         return [t for t in out if t[0] not in [o[0] for o in out[:out.index(t)]]]
 
     def claim_all(self):
         for num, *_ in self.ifaces:
             if num in self.claimed:
                 continue
-            if L.libusb_kernel_driver_active(self.h, num) == 1:
-                L.libusb_detach_kernel_driver(self.h, num)
             r = L.libusb_claim_interface(self.h, num)
             if r == 0:
                 self.claimed.add(num)
             else:
                 log("claim interface %d failed: %d" % (num, r))
 
-    def record(self):
-        path = ("/sys/bus/usb/devices/" + self.busid).encode().ljust(256, b"\0")
-        busid = self.busid.encode().ljust(32, b"\0")
-        d = self.desc
-        return (path + busid + struct.pack(">IIIHHHBBBBBB", self.bus, self.addr, self.speed, d.idVendor, d.idProduct,
-                d.bcdDevice, d.bDeviceClass, d.bDeviceSubClass, d.bDeviceProtocol, self.config_value,
-                d.bNumConfigurations, len(self.ifaces)))
+
+def attr(busid, name, base=SYSFS):
+    with open(os.path.join(base, busid, name)) as f:
+        return f.read().strip()
+
+
+def exportable(exclude, base=SYSFS):
+    out = []
+    for name in sorted(os.listdir(base)):
+        if ":" in name or name.startswith("usb"):
+            continue
+        try:
+            if attr(name, "bDeviceClass", base) == "09":
+                continue
+            vp = "%s:%s" % (attr(name, "idVendor", base), attr(name, "idProduct", base))
+        except OSError:
+            continue
+        if name not in exclude and vp not in exclude:
+            out.append(name)
+    return out
+
+
+def interfaces(busid, base=SYSFS):
+    out = []
+    for name in sorted(os.listdir(os.path.join(base, busid))):
+        if name.startswith(busid + ":"):
+            out.append(tuple(int(attr(os.path.join(busid, name), k, base), 16) for k in
+                             ("bInterfaceClass", "bInterfaceSubClass", "bInterfaceProtocol")))
+    return out
+
+
+def record(busid, base=SYSFS):
+    a = lambda k: attr(busid, k, base)
+    h = lambda k: int(a(k), 16)
+    return (("/sys/bus/usb/devices/" + busid).encode().ljust(256, b"\0") + busid.encode().ljust(32, b"\0") +
+            struct.pack(">IIIHHHBBBBBB", int(a("busnum")), int(a("devnum")), SPEED.get(a("speed"), 2),
+                        h("idVendor"), h("idProduct"), h("bcdDevice"), h("bDeviceClass"), h("bDeviceSubClass"),
+                        h("bDeviceProtocol"), int(a("bConfigurationValue") or 1), int(a("bNumConfigurations")),
+                        len(interfaces(busid, base))))
 
 
 class Session:
@@ -291,6 +347,15 @@ class Session:
             self.alive = False
 
 
+def keepalive(sock):
+    # A client that vanished without a FIN would otherwise hold its device forever.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 30000)
+
+
 def endpoints(dev):
     raw = ctypes.create_string_buffer(512)
     n = L.libusb_control_transfer(dev.h, 0x80, 6, 0x0200, 0, raw, 512, 1000)
@@ -302,50 +367,77 @@ def endpoints(dev):
     return eps
 
 
-def serve(dev, port):
-    dev.interrupt_eps = endpoints(dev)
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", port))
-    srv.listen(1)
-    log("exporting %04x:%04x as busid %s on tcp %d (interfaces %s, interrupt eps %s)" % (
-        dev.desc.idVendor, dev.desc.idProduct, dev.busid, port, [i[0] for i in dev.ifaces], [hex(e) for e in dev.interrupt_eps]))
-    while True:
-        sock, peer = srv.accept()
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log("connection from", peer)
+class Server:
+    def __init__(self, port, exclude):
+        self.port, self.exclude = port, exclude
+        self.active = {}
+        self.lock = threading.Lock()
+
+    def available(self):
+        with self.lock:
+            return [b for b in exportable(self.exclude) if b not in self.active]
+
+    def serve(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.port))
+        srv.listen(8)
+        log("serving tcp %d; exportable now: %s" % (self.port, exportable(self.exclude)))
+        while True:
+            sock, peer = srv.accept()
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            keepalive(sock)
+            threading.Thread(target=self.handle, args=(sock, peer), daemon=True).start()
+
+    def handle(self, sock, peer):
         try:
             ver, code, _status = struct.unpack(">HHI", recv_exact(sock, 8))
             if code == 0x8005:  # OP_REQ_DEVLIST
-                rec = dev.record() + b"".join(struct.pack("BBBB", c, s, p, 0) for _n, c, s, p in dev.ifaces)
-                sock.sendall(struct.pack(">HHII", ver, 0x0005, 0, 1) + rec)
-                sock.close()
+                devs = self.available()
+                body = b"".join(record(b) + b"".join(struct.pack("BBBB", *i, 0) for i in interfaces(b)) for b in devs)
+                sock.sendall(struct.pack(">HHII", ver, 0x0005, 0, len(devs)) + body)
             elif code == 0x8003:  # OP_REQ_IMPORT
-                want = recv_exact(sock, 32).split(b"\0")[0].decode()
-                if want != dev.busid:
-                    log("import of unknown busid", want)
-                    sock.sendall(struct.pack(">HHI", ver, 0x0003, 1))
-                    sock.close()
-                    continue
-                sock.sendall(struct.pack(">HHI", ver, 0x0003, 0) + dev.record())
-                log("imported by", peer)
-                elog = EtnfLog(LOG_ROOT, dev.busid, dev.desc.idVendor, dev.desc.idProduct, "%s:%d" % peer)
-                log("logging traffic to", elog.dir)
-                try:
-                    Session(sock, dev, elog).run()
-                finally:
-                    elog.close()
-                sock.close()
-                if dev.gone:
-                    log("device handle stale; exiting for a fresh supervisor restart")
-                    srv.close()
-                    return
+                self.import_(sock, peer, ver, recv_exact(sock, 32).split(b"\0")[0].decode())
             else:
-                log("unknown op 0x%04x" % code)
-                sock.close()
+                log("unknown op 0x%04x from %s" % (code, peer))
         except (ConnectionError, OSError, struct.error) as e:
-            log("connection error:", e)
+            log("connection error from %s: %s" % (peer, e))
+        finally:
             sock.close()
+
+    def import_(self, sock, peer, ver, busid):
+        with self.lock:
+            ok = busid in exportable(self.exclude) and busid not in self.active
+            if ok:
+                self.active[busid] = peer
+        dev = None
+        try:
+            if ok:
+                dev = Device(busid)
+        except (OSError, ValueError) as e:
+            log("import of %s failed: %s" % (busid, e))
+        if dev is None:
+            log("refusing import of %s by %s" % (busid, peer))
+            with self.lock:
+                if ok:
+                    del self.active[busid]
+            sock.sendall(struct.pack(">HHI", ver, 0x0003, 1))
+            return
+        try:
+            sock.sendall(struct.pack(">HHI", ver, 0x0003, 0) + record(busid))
+            log("%s %04x:%04x imported by %s (interfaces %s, interrupt eps %s)" % (
+                busid, dev.desc.idVendor, dev.desc.idProduct, peer, [i[0] for i in dev.ifaces],
+                [hex(e) for e in dev.interrupt_eps]))
+            elog = EtnfLog(LOG_ROOT, busid, dev.desc.idVendor, dev.desc.idProduct, "%s:%d" % peer)
+            try:
+                Session(sock, dev, elog).run()
+            finally:
+                elog.close()
+        finally:
+            dev.close()
+            with self.lock:
+                del self.active[busid]
+            log("%s released" % busid)
 
 
 def recv_exact(sock, n):
@@ -360,11 +452,9 @@ def recv_exact(sock, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vid", default="248a")
-    ap.add_argument("--pid", default="8002")
     ap.add_argument("--port", type=int, default=3240)
-    ap.add_argument("--busid", default="1-1")
+    ap.add_argument("--exclude", action="append", default=[], help="busid or vid:pid to keep off the export list")
     ap.add_argument("--log-dir", default=os.path.expanduser("~/usbip/log"))
     a = ap.parse_args()
     LOG_ROOT = a.log_dir
-    serve(Device(int(a.vid, 16), int(a.pid, 16), a.busid), a.port)
+    Server(a.port, set(e.lower() for e in a.exclude)).serve()

@@ -10,3 +10,4 @@ pyarrow = "*"
 [tasks]
 serve = "python usbip_frame.py"
 migrate = "python etnf_migrate.py log"
+test = "python test_enumeration.py"
